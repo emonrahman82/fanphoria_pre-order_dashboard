@@ -4,7 +4,6 @@
 <title>FanPhoria Pre-Order Management</title>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;800&family=Figtree:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <style>
 :root{--bg:#f8f4f4;--card:#fff;--ink:#141012;--mut:#6e6366;--line:#eadddf;--acc:#bc1823;--acc2:#141012;--side:#0b0b0c;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
 @media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0d0b0c;--card:#171415;--ink:#f5eeee;--mut:#a89b9e;--line:#2e2527;--acc:#bc1823;--acc2:#f5eeee;--side:#050505}}
@@ -64,11 +63,10 @@ textarea{min-height:60px;resize:vertical}label{font-size:12.5px;color:var(--mut)
 <script>
 /* ===== ADMIN LOGINS — edit usernames/passwords here (add more lines for more admins) ===== */
 const ADMINS=[{user:"admin",pass:"FanPhoria@2026"}];
-/* ===== GOOGLE SYNC — replace the dummy URL below with your Apps Script Web App URL (Sheet = text, Drive = photos) ===== */
-const GOOGLE_SCRIPT_URL="https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID/exec";
-const gOn=()=>!/YOUR_DEPLOYMENT_ID/.test(GOOGLE_SCRIPT_URL);
-async function gSync(action,payload){if(!gOn())return;try{await fetch(GOOGLE_SCRIPT_URL,{method:"POST",mode:"no-cors",headers:{"Content-Type":"text/plain;charset=utf-8"},body:JSON.stringify({action,...payload})})}catch(e){toast("Google sync failed")}}
-async function gOrder(oid,o,c){if(!gOn())return;const imgs=[];for(const p of o.products||[]){if(!p.photo)continue;try{const b=await(await fetch("/_blob/"+p.photo)).blob();const b64=await new Promise(r=>{const f=new FileReader();f.onload=()=>r(f.result.split(",")[1]);f.readAsDataURL(b)});imgs.push({id:p.photo,mime:b.type,b64})}catch(e){}}gSync("upsert",{order:{id:oid,...o},customer:{id:o.cid,...c},images:imgs})}
+/* ===== GOOGLE CONNECTION — paste your Apps Script Web app URL and secret token here ===== */
+const APPS_SCRIPT_URL="PASTE_YOUR_WEB_APP_URL_HERE";
+const APPS_SCRIPT_TOKEN="change-this-secret";
+const CONNECTED=!APPS_SCRIPT_URL.startsWith("PASTE");
 const ST=["New","Confirmed","Ordered","In Transit","Received","Ready for Delivery","Delivered","Cancelled"];
 const SC={New:"#d97706",Confirmed:"#2563eb",Ordered:"#7c3aed","In Transit":"#0891b2",Received:"#0d9488","Ready for Delivery":"#c026d3",Delivered:"#1f8a5b",Cancelled:"#6b7280"};
 const CATS=["Figure","Plush","Keychain","Clothing","Poster","Accessories","Manga","Other"];
@@ -83,27 +81,58 @@ const chip=s=>`<span class="chip" style="--c:${SC[s]||"#666"}">${esc(s)}</span>`
 const cu=o=>custs.find(c=>c.id===o.cid)||{};
 const live=o=>o.status!=="Cancelled";
 const toast=m=>{const t=$("#toast");t.textContent=m;t.style.display="block";clearTimeout(t._t);t._t=setTimeout(()=>t.style.display="none",3200)};
-const imgT=id=>id?`<img src="/_blob/${esc(id)}" alt="">`:"";
+const imgT=id=>id?`<img src="https://drive.google.com/thumbnail?id=${esc(id)}&sz=w800" alt="">`:"";
 const hr=u=>!u?"":/^https?:\/\//i.test(u)?u:"https://"+u.replace(/^[a-z]+:\/*/i,"");
 const pimg=p=>p.photo?imgT(p.photo):p.img?`<img src="${esc(hr(p.img))}" alt="" referrerpolicy="no-referrer">`:"";
+
+/* ---------- Google Sheet + Drive adapter ---------- */
+const store={orders:{},customers:{}},subs={orders:[],customers:[]};
+const emit=c=>{const docs=Object.entries(store[c]).map(([id,d])=>({id,data:()=>d}));subs[c].forEach(f=>f({docs}))};
+async function call(d){
+  if(!CONNECTED)throw new Error("Google Sheet not connected yet - set APPS_SCRIPT_URL in the code");
+  const r=await fetch(APPS_SCRIPT_URL,{method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},body:JSON.stringify({...d,token:APPS_SCRIPT_TOKEN})});
+  const j=await r.json();if(!j.ok)throw new Error(j.error||"Sync failed");return j;
+}
+async function loadAll(){
+  if(!CONNECTED)return;
+  try{
+    const r=await fetch(APPS_SCRIPT_URL+"?token="+encodeURIComponent(APPS_SCRIPT_TOKEN)),j=await r.json();if(!j.ok)throw new Error(j.error||"load failed");
+    const so={},sc={};j.items.forEach(({order,customer})=>{const{id,...o}=order;so[id]=o;if(customer&&order.cid)sc[order.cid]=customer});
+    if(JSON.stringify(so)!==JSON.stringify(store.orders)||JSON.stringify(sc)!==JSON.stringify(store.customers)){store.orders=so;store.customers=sc;emit("orders");emit("customers")}
+  }catch(e){toast("Could not load from Google Sheet: "+e.message)}
+}
+function makeDb(){
+  return{collection:c=>({onSnapshot:f=>{subs[c].push(f);emit(c)}}),
+  doc:p=>{const[c,id]=p.split("/");
+    const saveO=async o=>{await call({action:"saveOrder",order:{id,...o},customer:store.customers[o.cid]||{}});store.orders[id]=o;emit("orders")};
+    return{
+      set:async d=>{if(c==="customers"){store.customers[id]=d;emit("customers")}else await saveO(d)},
+      update:async d=>{if(c==="orders")await saveO({...store.orders[id],...d});else{store.customers[id]={...store.customers[id],...d};emit("customers")}},
+      delete:async()=>{await call({action:"deleteOrder",id});delete store.orders[id];emit("orders")}};
+  }};
+}
+async function shrink(f){try{const b=await createImageBitmap(f),s=Math.min(1,1600/Math.max(b.width,b.height)),c=document.createElement("canvas");c.width=Math.round(b.width*s);c.height=Math.round(b.height*s);c.getContext("2d").drawImage(b,0,0,c.width,c.height);return await new Promise(r=>c.toBlob(r,"image/jpeg",.85))}catch(e){return f}}
+function makeAssets(){return{upload:async f=>{const bl=await shrink(f),data=await new Promise(res=>{const rd=new FileReader();rd.onload=()=>res(rd.result.split(",")[1]);rd.readAsDataURL(bl)});const j=await call({action:"uploadImage",data,mime:bl.type||"image/jpeg",name:"fanphoria-"+Date.now()+".jpg"});return{id:j.id}}}}
+function makeDl(){return{save:async({filename,data})=>{const u=URL.createObjectURL(new Blob([data])),a=document.createElement("a");a.href=u;a.download=filename;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),4000)}}}
 
 let TH=null;try{TH=localStorage.getItem("fp-theme")}catch(e){}
 const sysT=()=>matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light";
 function applyTh(){const t=TH||sysT();document.documentElement.dataset.theme=t;$("#tg").textContent=t==="dark"?"☀ Light mode":"☾ Dark mode"}
 applyTh();try{matchMedia("(prefers-color-scheme: dark)").addEventListener("change",()=>{if(!TH)applyTh()})}catch(e){}
 (async()=>{
-  try{const c=window.claude;if(c){db=await c.use("db");assets=await c.use("assets");dl=await c.use("downloads")}}catch(e){}
+  db=makeDb();assets=makeAssets();dl=makeDl();
   render(true);if(!db)return;
   const er=e=>toast("Storage error: "+(e.message||e.code));
   db.collection("orders").onSnapshot(s=>{orders=s.docs.map(d=>({...d.data(),id:d.id}));render()},er);
   db.collection("customers").onSnapshot(s=>{custs=s.docs.map(d=>({...d.data(),id:d.id}));render()},er);
+  loadAll();setInterval(()=>{if(!document.hidden&&authed()&&!$(".prow"))loadAll()},60000);
 })();
 
 function render(force){
   $("#nav").innerHTML=NAV.map(([k,l])=>`<button data-v="${k}" class="${view===k?"on":""}">${l}</button>`).join("");
   if(view==="form"&&!force)return drawModal();
   const V={dash,form:formV,all:allV,cust:custV,prod:prodV,rep:repV,exp:expV}[view];
-  $("#main").innerHTML=(db?"":`<div class="warn">Persistent storage isn't available in this view, so nothing can be saved. Open the published link while signed in.</div>`)+V();
+  $("#main").innerHTML=(CONNECTED?"":`<div class="warn">Google Sheet isn't connected yet. Paste your Apps Script URL into APPS_SCRIPT_URL at the top of the code. Nothing can be saved until then.</div>`)+V();
   if(view==="form")fillForm();
   drawModal();
 }
@@ -165,7 +194,7 @@ function addRow(p={}){
   r.innerHTML=`<div><label class="pic">${pimg(p)||"+ Photo"}<input type="file" accept="image/*" hidden></label></div>
   <div><div class="f"><div><label>Product name *</label><input class="pn" value="${esc(p.name)}"></div><div><label>Price (৳)</label><input class="pp" type="number" min="0" step="any" value="${p.price||""}"></div>
   <div><label>Category</label><select class="pc">${CATS.map(x=>`<option ${x===(p.cat||"Other")?"selected":""}>${x}</option>`).join("")}</select></div></div>
-  <div class="f"><div><label>Anime / Series</label><input class="pa" list="al" value="${esc(p.anime)}" placeholder="e.g. Naruto"></div><div><label>Notes</label><input class="po" value="${esc(p.notes)}"></div></div><div class="f"><div><label>Image URL (saved as a link; click the photo box to upload so it displays)</label><input class="pi" type="url" value="${esc(p.img)}" placeholder="https://…/image.jpg"></div></div>
+  <div class="f"><div><label>Anime / Series</label><input class="pa" list="al" value="${esc(p.anime)}" placeholder="e.g. Naruto"></div><div><label>Notes</label><input class="po" value="${esc(p.notes)}"></div></div><div class="f"><div><label>Image URL (optional) or click the photo box to upload to Google Drive</label><input class="pi" type="url" value="${esc(p.img)}" placeholder="https://…/image.jpg"></div></div>
   <button class="b g rm" type="button">Remove</button></div>`;
   $("#prods").appendChild(r);
 }
@@ -191,7 +220,7 @@ async function save(){
     await db.doc("customers/"+cid).set({name:v("cn"),phone:v("cp"),address:v("ca"),notes:v("cno"),created:oc?.created||now,updated:now});
     const y=new Date().getFullYear(),oid=edit||`FP-${y}-`+String(Math.max(0,...orders.filter(o=>o.id.startsWith(`FP-${y}-`)).map(o=>+o.id.slice(-4)||0))+1).padStart(4,"0");
     const st=v("os");
-    const OD={cid,date:v("od")||today(),expected:v("oe"),status:st,notes:v("on"),products:ps,total:ps.reduce((a,p)=>a+p.price,0),delivered:st==="Delivered"?(old?.delivered||today()):"",created:old?.created||now,updated:now};await db.doc("orders/"+oid).set(OD);gOrder(oid,OD,{name:v("cn"),phone:v("cp"),address:v("ca"),notes:v("cno")});
+    const OD={cid,date:v("od")||today(),expected:v("oe"),status:st,notes:v("on"),products:ps,total:ps.reduce((a,p)=>a+p.price,0),delivered:st==="Delivered"?(old?.delivered||today()):"",created:old?.created||now,updated:now};await db.doc("orders/"+oid).set(OD);
     toast("Saved "+oid);edit=null;view="all";detail=oid;render(true);
   }catch(e){b.disabled=false;toast("Could not save: "+(e.message||e.code))}
 }
@@ -213,7 +242,7 @@ const INVCSS=".invoice{background:#fff;color:#111;box-sizing:border-box;width:21
 function invDoc(o){const c=cu(o),ps=o.products||[];
   return `<style>${INVCSS}</style><div class="invoice"><div class="ih"><div><div class="ib">Fan<b>Phoria</b></div><div>Pre-order invoice</div></div><div class="ir"><h2>INVOICE</h2><div>No. INV-${o.id}</div><div>Issued ${fd(today())}</div></div></div><div class="ig"><div><small>Billed to</small><b>${esc(c.name)}</b><br>${esc(c.phone)}<br>${esc(c.address)}</div><div><small>Order</small>Pre-order ${o.id}<br>Order date ${fd(o.date)}<br>Expected arrival ${fd(o.expected)}<br>Status: ${esc(o.status)}</div></div><table><thead><tr><th>#</th><th>Item</th><th>Category</th><th class="r">Price</th></tr></thead><tbody>${ps.map((p,i)=>`<tr><td>${i+1}</td><td>${esc(p.name)}</td><td>${esc(p.cat)}</td><td class="r">${tk(p.price)}</td></tr>`).join("")}</tbody><tfoot><tr><td colspan="3" class="r"><b>Total</b></td><td class="r"><b>${tk(o.total)}</b></td></tr></tfoot></table>${o.notes?`<p><b>Notes:</b> ${esc(o.notes)}</p>`:""}<p class="ift">Thank you for pre-ordering with FanPhoria.</p></div>`}
 async function setSt(id,st){
-  try{await db.doc("orders/"+id).update({status:st,updated:new Date().toISOString(),delivered:st==="Delivered"?today():""});toast("Status: "+st);gSync("status",{id,status:st})}catch(e){toast("Could not update: "+(e.message||e.code))}
+  try{await db.doc("orders/"+id).update({status:st,updated:new Date().toISOString(),delivered:st==="Delivered"?today():""});toast("Status: "+st)}catch(e){toast("Could not update: "+(e.message||e.code))}
 }
 
 /* ---------- Customers, Products, Reports ---------- */
@@ -243,8 +272,8 @@ function expRows(){
 }
 function expV(){
   return `<h1>Backup / Export</h1><div class="card"><p>Exports include every customer, order and product (one row per product) with prices, categories, URLs and status. Take a backup regularly.</p>
-  <button class="b" data-ex="csv">Download CSV</button> <button class="b g" data-ex="xlsx">Download Excel (.xlsx)</button> <button class="b g" data-ex="zip">Download all photos (ZIP)</button>
-  <p class="mut" style="margin-top:16px">${orders.length} pre-orders · ${custs.length} customers · ${orders.reduce((a,o)=>a+(o.products||[]).length,0)} products. To mirror in your Google Sheet: download the CSV, then in the sheet choose File → Import → Upload.</p></div>`;
+  <button class="b" data-ex="csv">Download CSV</button> <button class="b g" data-ex="xlsx">Download Excel (.xlsx)</button> 
+  <p class="mut" style="margin-top:16px">${orders.length} pre-orders · ${custs.length} customers · ${orders.reduce((a,o)=>a+(o.products||[]).length,0)} products. Orders save live to your Google Sheet and photos to Google Drive; these downloads are extra backups.</p></div>`;
 }
 async function zipPhotos(n){
   if(!window.JSZip)return toast("ZIP library failed to load");
@@ -272,7 +301,7 @@ function checkAuth(){document.body.classList.toggle("locked",!authed());if(!auth
 function login(){const u=$("#lu").value.trim(),p=$("#lp").value;if(ADMINS.some(a=>a.user===u&&a.pass===p)){AUTH=true;try{sessionStorage.setItem("fp-auth","1")}catch(e){}$("#lp").value="";$("#le").textContent="";checkAuth()}else $("#le").textContent="Incorrect username or password."}
 function logout(){AUTH=false;try{sessionStorage.removeItem("fp-auth")}catch(e){}checkAuth()}
 document.addEventListener("keydown",e=>{if(e.key==="Enter"&&(e.target.id==="lu"||e.target.id==="lp"))login()});
-addEventListener("error",e=>{const i=e.target;if(i&&i.tagName==="IMG"&&!(i.src||"").includes("/_blob/")){const a=document.createElement("a");a.href=i.src;a.target="_blank";a.rel="noopener noreferrer";a.textContent="Open image ↗";i.replaceWith(a)}},true);
+addEventListener("error",e=>{const i=e.target;if(i&&i.tagName==="IMG"&&!(i.src||"").includes("drive.google.com")){const a=document.createElement("a");a.href=i.src;a.target="_blank";a.rel="noopener noreferrer";a.textContent="Open image ↗";i.replaceWith(a)}},true);
 checkAuth();
 
 /* ---------- Events ---------- */
@@ -284,7 +313,7 @@ document.addEventListener("click",e=>{
   else if(x=g("[data-open]")){e.preventDefault();detail=x.dataset.open;drawModal()}
   else if(x=g("[data-edit]")){edit=x.dataset.edit;go("form")}
   else if(x=g("[data-cancel]")){setSt(x.dataset.cancel,"Cancelled")}
-  else if(x=g("[data-del]")){const id=x.dataset.del;if(armed===id){armed=0;db.doc("orders/"+id).delete().then(()=>{detail=null;toast("Deleted "+id);gSync("delete",{id});drawModal()}).catch(er=>toast("Delete failed: "+er.message))}else{armed=id;drawModal();setTimeout(()=>{armed=0;if(detail)drawModal()},4000)}}
+  else if(x=g("[data-del]")){const id=x.dataset.del;if(armed===id){armed=0;db.doc("orders/"+id).delete().then(()=>{detail=null;toast("Deleted "+id);drawModal()}).catch(er=>toast("Delete failed: "+er.message))}else{armed=id;drawModal();setTimeout(()=>{armed=0;if(detail)drawModal()},4000)}}
   else if(x=g("[data-ex]")){doExport(x.dataset.ex)}
   else if(x=g("[data-inv]")){inv=x.dataset.inv;drawModal();$("#modal").scrollIntoView()}
   else if(g("[data-back]")){inv=null;drawModal()}
